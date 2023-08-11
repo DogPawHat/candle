@@ -7,3 +7,4 @@ pub const INDEXING: &str = include_str!(concat!(env!("OUT_DIR"), "/indexing.ptx"
 pub const REDUCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce.ptx"));
 pub const TERNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/ternary.ptx"));
 pub const UNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/unary.ptx"));
+pub const UPSAMPLE_NEAREST: &str = include_str!(concat!(env!("OUT_DIR"), "/upsample_nearest.ptx"));

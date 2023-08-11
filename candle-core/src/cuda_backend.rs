@@ -885,6 +885,7 @@ impl<'a> Map2InPlace for ScatterAdd<'a> {
 }
 
 struct Conv1D<'a>(&'a crate::conv::ParamsConv1D);
+
 impl<'a> Map2 for Conv1D<'a> {
     fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
         &self,
@@ -894,7 +895,7 @@ impl<'a> Map2 for Conv1D<'a> {
         k_l: &Layout,
         dev: &CudaDevice,
     ) -> Result<CudaSlice<T>> {
-        // Kernel shape: (c_out, c_in_k, k_size)
+        // Kernel shape: (c_out, c_in_k, k_h, k_w)
         // Input shape: (b_size, c_in, l_in) or (c_in, l_in)
         let p = &self.0;
 
@@ -918,6 +919,91 @@ impl<'a> Map2 for Conv1D<'a> {
         };
         let ds = dev.htod_copy(ds).w()?;
         let params = (el, l_out, p.stride, &ds, inp, k, &out);
+        // SAFETY: ffi.
+        unsafe { func.launch(cfg, params) }.w()?;
+        Ok(out)
+    }
+}
+
+struct Conv2D<'a>(&'a crate::conv::ParamsConv2D);
+
+impl<'a> Map2 for Conv2D<'a> {
+    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+        &self,
+        inp: &CudaSlice<T>,
+        inp_l: &Layout,
+        k: &CudaSlice<T>,
+        k_l: &Layout,
+        dev: &CudaDevice,
+    ) -> Result<CudaSlice<T>> {
+        // Kernel shape: (c_out, c_in_k, k_size, k_size)
+        // Input shape: (b_size, c_in, h_in, w_in) or (c_in, h_in, w_in)
+        let p = &self.0;
+
+        let inp = &inp.slice(inp_l.start_offset()..);
+        let k = &k.slice(k_l.start_offset()..);
+        let shape = inp_l.shape();
+        let dims = shape.dims();
+        let el = shape.elem_count();
+        let out_h = p.out_h();
+        let out_w = p.out_w();
+        let dst_el = p.c_out * out_h * out_w * p.b_size;
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let func = dev.get_or_load_func(&kernel_name::<T>("conv2d"), kernels::CONV)?;
+        // SAFETY: Set later by running the kernel.
+        let out = unsafe { dev.alloc::<T>(dst_el) }.w()?;
+        let ds = if dims.len() == 4 {
+            [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
+        } else {
+            panic!("unexpected input shape for conv2d {dims:?}")
+        };
+        let ds = dev.htod_copy(ds).w()?;
+        let params = (el, out_h, out_w, p.stride, &ds, inp, k, &out);
+        // SAFETY: ffi.
+        unsafe { func.launch(cfg, params) }.w()?;
+        Ok(out)
+    }
+}
+
+struct UpsampleNearest2D(usize, usize);
+
+impl Map1 for UpsampleNearest2D {
+    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+        &self,
+        src: &CudaSlice<T>,
+        dev: &CudaDevice,
+        layout: &Layout,
+    ) -> Result<CudaSlice<T>> {
+        let shape = layout.shape();
+        let dims = shape.dims();
+        let numel = shape.elem_count();
+
+        let inp = &src.slice(layout.start_offset()..);
+        let func = dev.get_or_load_func(
+            &kernel_name::<T>("upsample_nearest2d"),
+            kernels::UPSAMPLE_NEAREST,
+        )?;
+
+        let (dst_h, dst_w) = (self.0, self.1);
+        let (src_h, src_w) = (dims[2], dims[3]);
+        let scale_h = src_h as f64 / dst_h as f64;
+        let scale_w = src_w as f64 / dst_w as f64;
+
+        let info = if dims.len() == 4 {
+            [[dims, layout.stride()].concat()].concat()
+        } else {
+            panic!("unexpected input shape for upsample_nearest2d {dims:?}")
+        };
+        let info = dev.htod_copy(info).w()?;
+        let b_sz = dims[0];
+        let c = dims[1];
+
+        let cfg = LaunchConfig::for_num_elems((b_sz * c * dst_h * dst_w) as u32);
+
+        // SAFETY: Set later by running the kernel.
+        let out = unsafe { dev.alloc::<T>(b_sz * c * dst_h * dst_w) }.w()?;
+
+        let params = (numel, &info, dst_h, dst_w, scale_h, scale_w, inp, &out);
         // SAFETY: ffi.
         unsafe { func.launch(cfg, params) }.w()?;
         Ok(out)
@@ -1384,11 +1470,13 @@ impl BackendStorage for CudaStorage {
     fn conv2d(
         &self,
         _l: &Layout,
-        _kernel: &Self,
-        _kernel_l: &Layout,
-        _params: &crate::conv::ParamsConv2D,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        todo!()
+        let device = self.device().clone();
+        let slice = Conv2D(params).map(&self.slice, _l, &kernel.slice, kernel_l, &device)?;
+        Ok(Self { slice, device })
     }
 
     fn avg_pool2d(&self, _: &Layout, _: (usize, usize), _: (usize, usize)) -> Result<Self> {
@@ -1399,8 +1487,11 @@ impl BackendStorage for CudaStorage {
         todo!()
     }
 
-    fn upsample_nearest2d(&self, _: &Layout, _: usize, _: usize) -> Result<Self> {
-        todo!()
+    fn upsample_nearest2d(&self, l: &Layout, h: usize, w: usize) -> Result<Self> {
+        let device = self.device().clone();
+        let slice: CudaStorageSlice =
+            UpsampleNearest2D(h, w).map(&self.slice, &device, l)?;
+        Ok(Self { slice, device })
     }
 
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
